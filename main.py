@@ -1,16 +1,35 @@
 from time import time
 from wilds import get_dataset
 from wilds.common.data_loaders import get_train_loader, get_eval_loader
+from wilds.common.grouper import CombinatorialGrouper
 import torchvision.transforms as transforms
 import torch
-from transformers import AutoImageProcessor, ResNetForImageClassification
+from transformers import AutoImageProcessor, ResNetForImageClassification, ResNetConfig
 import torch.optim as optim
 import argparse
 import numpy as np
 import json
+import torch.nn as nn
+from torch.utils.tensorboard import SummaryWriter
+
+class ModifiedResNetForImageClassification(ResNetForImageClassification):
+    def __init__(self, config: ResNetConfig):
+        super().__init__(config)
+        # Modify the last fully connected layer to output 182 dimensions
+        num_features = self.classifier[-1].in_features
+        self.classifier[-1] = nn.Linear(num_features, 182)
+        # Add softmax activation
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x, **kwargs):
+        outputs = super().forward(x, **kwargs)
+        logits = outputs.logits
+        logits = self.softmax(logits)
+        return logits
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(device)
+writer = SummaryWriter()
 
 def IRM_loss(model, inputs, outputs):
     # Compute gradients of outputs with respect to inputs
@@ -26,15 +45,16 @@ if __name__ == '__main__':
     dataset = get_dataset(dataset="iwildcam", download=False)
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--learning_rate", type=float, default=1e-5)
-    parser.add_argument("--epoch", type=int,default=3)
-    parser.add_argument("--batch_size",type=int,default=32)
-    parser.add_argument("--group",type=bool,default=False)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--epoch", type=int,default=10)
+    parser.add_argument("--batch_size",type=int,default=16)
+    parser.add_argument("--group",type=int,default=1)
     parser.add_argument("--subset_size", type=float,default=0.3)
 
     # hyperparameter sweep [1e-5,1e-4,5e-6]
     args = parser.parse_args()
-    model = ResNetForImageClassification.from_pretrained("microsoft/resnet-50")
+    config = ResNetConfig.from_pretrained("microsoft/resnet-50")
+    model = ModifiedResNetForImageClassification(config)
     model.to(device)
     # criterion
     criterion = torch.nn.CrossEntropyLoss()
@@ -49,8 +69,10 @@ if __name__ == '__main__':
             [transforms.Resize((448, 448)), transforms.ToTensor()]
         ),
     )
-    if args.group:
-        train_loader = get_train_loader("group",train_data,batch_size=args.batch_size)
+    #print(dataset['from_source_domain'])
+    grouper = CombinatorialGrouper(dataset, ['location']) 
+    if args.group==1:
+        train_loader = get_train_loader("group",train_data,n_groups_per_batch=8,grouper=grouper,batch_size=args.batch_size)
     else:
         train_loader = get_train_loader("standard", train_data, batch_size=args.batch_size)
     # test_dataset = get_dataset(dataset="iwildcam", download=False, unlabeled=True)
@@ -113,16 +135,16 @@ if __name__ == '__main__':
             x = x.to(device)
             y = y.to(device)
             optimizer.zero_grad()
-            y_prediction = model(x)["logits"]
-            y_prediction = torch.softmax(y_prediction,dim=1)
+            y_prediction = model(x)
             loss = criterion(y_prediction,y)
-
+            
             loss.backward()
             optimizer.step()
 
             training_loss += loss.item()
             
         epoch_loss = training_loss / len(train_loader)
+        writer.add_scalar("Loss/train",epoch_loss,epoch)
         print(f'training_loss: {epoch_loss}')
 
         training_loss_list.append(epoch_loss)
@@ -132,17 +154,19 @@ if __name__ == '__main__':
         with torch.no_grad():
             for batch_idx, val_batch in enumerate(id_val_loader):
                 x,y,_ = val_batch
-                # if batch_idx >=100:
-                #     break
+                if batch_idx >=len(id_val_loader)*args.subset_size:
+                    break
                 x = x.to(device)
                 y = y.to(device)
 
-                y_prediction = model(x)['logits']
-                y_prediction = torch.softmax(y_prediction,dim=1)
+                y_prediction = model(x)
+                
                 loss = criterion(y_prediction,y)
+            
                 id_val_loss += loss.item()
 
         id_val_loss /= len(id_val_loader)
+        writer.add_scalar("Loss/id_val", id_val_loss,epoch)
         id_val_loss_list.append(id_val_loss)
         if id_val_loss <= best_id_val_loss:
             best_id_val_loss = id_val_loss
@@ -155,16 +179,16 @@ if __name__ == '__main__':
         with torch.no_grad():
             for batch_idx,val_batch in enumerate(ood_val_loader):
                 x,y,meta = val_batch
-                # if batch_idx>=1:
-                #     break
+                if batch_idx>=len(ood_val_loader)*args.subset_size:
+                    break
                 x = x.to(device)
                 y = y.to(device)
-                y_prediction = model(x)['logits']
-                y_prediction = torch.softmax(y_prediction,dim=1)
+                y_prediction = model(x)
                 loss = criterion(y_prediction,y)
                 id_val_loss += loss.item()
 
         ood_val_loss /= len(ood_val_loader)
+        writer.add_scalar("Loss/ood_val",ood_val_loss,epoch)
         ood_val_loss_list.append(ood_val_loss)
         if ood_val_loss <= best_ood_val_loss:
             best_ood_val_loss = ood_val_loss
@@ -183,24 +207,25 @@ if __name__ == '__main__':
                 x,y,metadata = test_batch
                 x = x.to(device)
                 y = y.to(device)
-                if batch_idx>=1:
+                if batch_idx>=len(id_test_loader)*args.subset_size:
                     break
 
-                y_prediction = model(x)['logits']
-                y_prediction = torch.argmax(torch.softmax(y_prediction,dim=1),dim=1)
+                y_prediction = model(x)
+                y_prediction = torch.argmax(y_prediction,dim=1)
 
-                all_y_pred.append(y_prediction.detach().cpu().numpy())
-                all_y_true.append(y.detach().cpu().numpy())
-                all_meta.append(metadata)
-        all_y_pred_tensor = torch.squeeze(torch.tensor(np.array(all_y_pred)))
-        all_y_true_tensor = torch.squeeze(torch.tensor(np.array(all_y_true)))
-        print(f'y true tensor{all_y_true_tensor.shape},y prediction tensor: {all_y_pred_tensor.shape}')
-        results,_ = dataset.eval(all_y_pred_tensor,all_y_true_tensor,all_meta)
+                all_y_pred.extend(y_prediction.detach().cpu().numpy().tolist())
+                all_y_true.extend(y.detach().cpu().numpy().tolist())
+                all_meta.extend(metadata)
+        #print(f'y true tensor{all_y_true_tensor.shape},y prediction tensor: {all_y_pred_tensor.shape}')
+        results,_ = dataset.eval(torch.tensor(all_y_pred),torch.tensor(all_y_true),all_meta)
+        writer.add_scalar("test/id_f1",results['F1-macro_all'],epoch)
+        writer.add_scalar("test/id_accuracy",results['acc_avg'],epoch)
+        writer.add_scalar("test/id_recall",results['recall-macro_all'],epoch)
         records_id.append(results)
 
         model.eval()
         model.load_state_dict(torch.load("best_ood_model_wts/best_ood_model.pt"))
-        # ID val and testing
+        # OOD val and testing
         all_y_pred= []
         all_y_true = []
         all_meta = []
@@ -209,20 +234,22 @@ if __name__ == '__main__':
                 x,y,metadata = test_batch
                 x = x.to(device)
                 y = y.to(device)
-                if batch_idx>=1:
+                if batch_idx>=len(ood_test_loader)*args.subset_size:
                     break
 
-                y_prediction = model(x)['logits']
-                y_prediction = torch.argmax(torch.softmax(y_prediction,dim=1),dim=1)
-                all_y_pred.append(y_prediction.detach().cpu().numpy())
-                all_y_true.append(y.detach().cpu().numpy())
-                all_meta.append(metadata)
-        all_y_pred_tensor = torch.squeeze(torch.tensor(np.array(all_y_pred)))
-        all_y_true_tensor = torch.squeeze(torch.tensor(np.array(all_y_true)))
-        print(f'y true tensor{all_y_true_tensor.shape},y prediction tensor: {all_y_pred_tensor.shape}')
-        results,_ = dataset.eval(all_y_pred_tensor,all_y_true_tensor,all_meta)
+                y_prediction = model(x)
+                y_prediction = torch.argmax(y_prediction,dim=1)
+                all_y_pred.extend(y_prediction.detach().cpu().numpy().tolist())
+                all_y_true.extend(y.detach().cpu().numpy().tolist())
+                all_meta.extend(metadata)
+        #print(f'y true tensor{all_y_true_tensor.shape},y prediction tensor: {all_y_pred_tensor.shape}')
+        results,_ = dataset.eval(torch.tensor(all_y_pred),torch.tensor(all_y_true),all_meta)
+        writer.add_scalar("test/ood_f1",results['F1-macro_all'],epoch)
+        writer.add_scalar("test/ood_accuracy",results['acc_avg'],epoch)
+        writer.add_scalar("test/ood_recall",results['recall-macro_all'],epoch)
         records_ood.append(results)
-    
+    writer.flush()
+    writer.close()
     with open(f"uniform_grouping_{args.group}_records.json","w") as file_write:
         record = {'group_uniform_sample':args.group,
         'batch':args.batch_size,
