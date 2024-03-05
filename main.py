@@ -10,15 +10,14 @@ import argparse
 import numpy as np
 import json
 import torch.nn as nn
+from wilds.common.metrics import GroupDRO
 from torch.utils.tensorboard import SummaryWriter
 
 class ModifiedResNetForImageClassification(ResNetForImageClassification):
     def __init__(self, config: ResNetConfig):
         super().__init__(config)
-        # Modify the last fully connected layer to output 182 dimensions
         num_features = self.classifier[-1].in_features
         self.classifier[-1] = nn.Linear(num_features, 182)
-        # Add softmax activation
         self.softmax = nn.Softmax(dim=1)
 
     def forward(self, x, **kwargs):
@@ -31,36 +30,36 @@ device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 print(device)
 writer = SummaryWriter()
 
-def IRM_loss(model, inputs, outputs):
-    # Compute gradients of outputs with respect to inputs
-    gradients = torch.autograd.grad(outputs=outputs, inputs=inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
+# def IRM_loss(model, inputs, outputs):
+#     gradients = torch.autograd.grad(outputs=outputs, inputs=inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
     
-    # Compute the penalty term as the squared norm of gradients
-    penalty = torch.mean(torch.sum(torch.square(gradients), dim=1))
+#     penalty = torch.mean(torch.sum(torch.square(gradients), dim=1))
     
-    return penalty
+#     return penalty
 
 if __name__ == '__main__':
     # Set argument Parsers
     dataset = get_dataset(dataset="iwildcam", download=False)
     parser = argparse.ArgumentParser()
     
-    parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--epoch", type=int,default=10)
+    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--epoch", type=int,default=12)
     parser.add_argument("--batch_size",type=int,default=16)
     parser.add_argument("--group",type=int,default=1)
-    parser.add_argument("--subset_size", type=float,default=0.3)
+    parser.add_argument("--subset_size", type=float,default=0.05)
 
     # hyperparameter sweep [1e-5,1e-4,5e-6]
     args = parser.parse_args()
     config = ResNetConfig.from_pretrained("microsoft/resnet-50")
     model = ModifiedResNetForImageClassification(config)
     model.to(device)
+    eval_model = ModifiedResNetForImageClassification(config)
+    eval_model.to(device)
     # criterion
     criterion = torch.nn.CrossEntropyLoss()
 
     # optimizer
-    optimizer = optim.Adam(model.parameters(),lr=args.learning_rate,weight_decay=1e-3)
+    optimizer = optim.Adam(model.parameters(),lr=args.learning_rate,weight_decay=1e-7)
     
     # Get the training set
     train_data = dataset.get_subset(
@@ -72,7 +71,8 @@ if __name__ == '__main__':
     #print(dataset['from_source_domain'])
     grouper = CombinatorialGrouper(dataset, ['location']) 
     if args.group==1:
-        train_loader = get_train_loader("group",train_data,n_groups_per_batch=8,grouper=grouper,batch_size=args.batch_size)
+        train_loader = get_train_loader("group",train_data,n_groups_per_batch=16,grouper=grouper,batch_size=args.batch_size)
+        print('loaded')
     else:
         train_loader = get_train_loader("standard", train_data, batch_size=args.batch_size)
     # test_dataset = get_dataset(dataset="iwildcam", download=False, unlabeled=True)
@@ -121,10 +121,11 @@ if __name__ == '__main__':
     id_val_loss_list = []
     ood_val_loss_list = []
 
+
     for epoch in range(args.epoch):
         print(f'Epoch: {epoch}')
         training_loss = 0
-        model.train(True)
+        model.train()
         start_time = time()
         for batch_idx, labeled_batch in enumerate(train_loader):
             if batch_idx>=len(train_loader)*args.subset_size:
@@ -143,7 +144,7 @@ if __name__ == '__main__':
 
             training_loss += loss.item()
             
-        epoch_loss = training_loss / len(train_loader)
+        epoch_loss = training_loss / (batch_idx+1)
         writer.add_scalar("Loss/train",epoch_loss,epoch)
         print(f'training_loss: {epoch_loss}')
 
@@ -165,7 +166,7 @@ if __name__ == '__main__':
             
                 id_val_loss += loss.item()
 
-        id_val_loss /= len(id_val_loader)
+        id_val_loss /= batch_idx+1
         writer.add_scalar("Loss/id_val", id_val_loss,epoch)
         id_val_loss_list.append(id_val_loss)
         if id_val_loss <= best_id_val_loss:
@@ -185,9 +186,9 @@ if __name__ == '__main__':
                 y = y.to(device)
                 y_prediction = model(x)
                 loss = criterion(y_prediction,y)
-                id_val_loss += loss.item()
+                ood_val_loss += loss.item()
 
-        ood_val_loss /= len(ood_val_loader)
+        ood_val_loss /= batch_idx+1
         writer.add_scalar("Loss/ood_val",ood_val_loss,epoch)
         ood_val_loss_list.append(ood_val_loss)
         if ood_val_loss <= best_ood_val_loss:
@@ -195,10 +196,10 @@ if __name__ == '__main__':
             torch.save(model.state_dict(),'best_ood_model_wts/best_ood_model.pt')
 
         # Testing ID dataset
-        model.eval()
-        model.load_state_dict(torch.load("best_id_model_wts/best_id_model.pt"))
-        id_test_loss = 0
+        eval_model.eval()
+        eval_model.load_state_dict(torch.load("best_id_model_wts/best_id_model.pt"))
         # ID val and testing
+        model.eval()
         all_y_pred= []
         all_y_true = []
         all_meta = []
@@ -223,8 +224,8 @@ if __name__ == '__main__':
         writer.add_scalar("test/id_recall",results['recall-macro_all'],epoch)
         records_id.append(results)
 
-        model.eval()
-        model.load_state_dict(torch.load("best_ood_model_wts/best_ood_model.pt"))
+        # eval_model.eval()
+        # eval_model.load_state_dict(torch.load("best_ood_model_wts/best_ood_model.pt"))
         # OOD val and testing
         all_y_pred= []
         all_y_true = []

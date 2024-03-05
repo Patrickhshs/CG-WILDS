@@ -19,8 +19,8 @@ def load_data(path):
     ood_recall_list  = [i['recall-macro_all'] for i in ood_list]
     ood_f1_score_list  = [i['F1-macro_all'] for i in ood_list]
     #data = [id_val_loss_list,ood_val_loss_list,training_loss_list,id_accuracy_list,id_recall_list,id_f1_score_list,ood_accuracy_list,ood_recall_list,ood_f1_score_list]
-    return pd.DataFrame({'id_val_loss':id_val_loss_list,
-        'ood_val_loss':ood_val_loss_list,
+    return pd.DataFrame({#'id_val_loss':id_val_loss_list,
+        #'ood_val_loss':ood_val_loss_list,
         'training_loss':training_loss_list,
         'id_accuracy':id_accuracy_list,
         'id_recall':id_recall_list,
@@ -45,5 +45,5 @@ def plot_visualization(data,columns_to_plot,title):
 
 
 if __name__ == '__main__':
-    data = load_data('/scratch/js12556/CG-WILDS/records.json')
-    plot_visualization(data,['id_val_loss','ood_val_loss'],'id val loss vs ood val loss')
+    data = load_data('/scratch/js12556/CG-WILDS/uniform_grouping_0_records.json')
+    plot_visualization(data,['id_f1','ood_f1'],'No uniform sampling of domain')
